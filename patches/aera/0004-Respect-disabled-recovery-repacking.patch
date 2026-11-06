@@ -1,0 +1,108 @@
+From: Arena Agent <agent@arena.ai>
+Date: Thu, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 4/4] AERA: respect disabled recovery repacking
+
+X6886 boots a zstd PLATFORM ramdisk plus an empty RECOVERY fragment in
+vendor_boot. The bundled repacker expects recovery.cpio and must not be
+advertised or reachable.
+
+AERA force-enabled TW_INCLUDE_REPACKTOOLS for vendor_boot/recovery-as-boot
+even when TW_NO_FLASH_CURRENT_TWRP was set. Guard those assignments and
+magiskboot inclusion, and reject runtime repack/reflash entry points when
+current-recovery flashing is disabled.
+
+diff --git a/Android.mk b/Android.mk
+index 488f1e4..741910c 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -229,7 +229,9 @@ ifneq ($(BOARD_BOOT_HEADER_VERSION),)
+ endif
+ 
+ ifeq ($(BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT),true)
+-    TW_INCLUDE_REPACKTOOLS := true
++    ifneq ($(TW_NO_FLASH_CURRENT_TWRP),true)
++        TW_INCLUDE_REPACKTOOLS := true
++    endif
+     LOCAL_CFLAGS += -DBOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT
+ endif
+ 
+@@ -242,6 +244,7 @@ ifeq ($(TW_NO_BIND_SYSTEM),true)
+ endif
+ 
+ ifeq ($(TW_NO_FLASH_CURRENT_TWRP),true)
++    TW_INCLUDE_REPACKTOOLS := false
+     LOCAL_CFLAGS += -DTW_NO_FLASH_CURRENT_TWRP
+ endif
+ 
+@@ -278,7 +281,9 @@ ifeq ($(TW_EXCLUDE_MTP),)
+     LOCAL_SHARED_LIBRARIES += libtwrpmtp-ffs
+ endif
+ ifeq ($(BOARD_USES_RECOVERY_AS_BOOT), true)
+-    TW_INCLUDE_REPACKTOOLS := true
++    ifneq ($(TW_NO_FLASH_CURRENT_TWRP),true)
++        TW_INCLUDE_REPACKTOOLS := true
++    endif
+     LOCAL_CFLAGS += -DBOARD_USES_RECOVERY_AS_BOOT
+ endif
+ 
+@@ -636,9 +641,11 @@ ifneq ($(TW_EXCLUDE_BASH), true)
+ endif
+ 
+ ifeq ($(TW_INCLUDE_REPACKTOOLS), true)
++ifneq ($(TW_NO_FLASH_CURRENT_TWRP),true)
+ TWRP_REQUIRED_MODULES += \
+     magiskboot
+ endif
++endif
+ 
+ ifeq ($(TW_INCLUDE_RESETPROP), true)
+ TWRP_REQUIRED_MODULES += \
+diff --git a/partitionmanager.cpp b/partitionmanager.cpp
+index d04b64a..750f367 100755
+--- a/partitionmanager.cpp
++++ b/partitionmanager.cpp
+@@ -4488,6 +4488,10 @@ bool TWPartitionManager::Flash_Image(string& path, string& filename,
+ 		repack = REPLACE_KERNEL;
+ 	}
+ 	if (repack != REPLACE_NONE) {
++#ifdef TW_NO_FLASH_CURRENT_TWRP
++		gui_err("Recovery repacking is disabled for this device.");
++		return false;
++#else
+ 		if (stream) return false;
+ 		Repack_Options_struct Repack_Options;
+ 		Repack_Options.Type = repack;
+@@ -4495,6 +4499,7 @@ bool TWPartitionManager::Flash_Image(string& path, string& filename,
+ 		Repack_Options.Disable_Force_Encrypt = false;
+ 		Repack_Options.Backup_First = DataManager::GetIntValue("tw_repack_backup_first") != 0;
+ 		return repacker.Repack_Image_And_Flash(full_filename, Repack_Options);
++#endif
+ 	}
+ 	PartitionSettings part_settings;
+ 	part_settings.Backup_Folder = path;
+diff --git a/twrpRepacker.cpp b/twrpRepacker.cpp
+index d6547e6..c54b4ec 100755
+--- a/twrpRepacker.cpp
++++ b/twrpRepacker.cpp
+@@ -126,6 +126,10 @@ static bool is_AB_for_repacker() {
+ }
+ 
+ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const struct Repack_Options_struct& Repack_Options) {
++#ifdef TW_NO_FLASH_CURRENT_TWRP
++	LOGERR("Recovery repacking is disabled for this device.\n");
++	return false;
++#endif
+ 	if (!TWFunc::Path_Exists(TWFunc::Get_MagiskBoot())) {
+ 		LOGERR("Image repacking tool not present in this AERA build!");
+ 		return false;
+@@ -322,6 +326,10 @@ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const
+ }
+ 
+ bool twrpRepacker::Flash_Current_Twrp() {
++#ifdef TW_NO_FLASH_CURRENT_TWRP
++	LOGERR("Recovery reflash is disabled for this device.\n");
++	return false;
++#endif
+ #ifndef OF_RECOVERY_AB_FULL_REFLASH_RAMDISK
+ 	// A/B with dedicated recovery partition
+ 	std::string slot = android::base::GetProperty("ro.boot.slot_suffix", "");

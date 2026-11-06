@@ -1,0 +1,161 @@
+From: Arena Agent <agent@arena.ai>
+Date: Thu, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 1/4] AERA: minuitwrp: probe X6886 sysfs haptics
+
+X6886 exposes regulator-vibrator brightness, vibrator duration/activate,
+or vibrator_single duration/activate instead of timed_output. Probe those
+LED interfaces before the optional force-feedback/HAL paths, pulse
+brightness off the UI thread, and report availability to the native AERA
+settings backend.
+
+This is the AERA counterpart of the device TWRP haptics patch; AERA uses
+minuitwrp/events.cpp and has no twrpminui force_feedback helper.
+
+diff --git a/aeraui/platform/aera_backend.cpp b/aeraui/platform/aera_backend.cpp
+index 91888fc..f4ece40 100644
+--- a/aeraui/platform/aera_backend.cpp
++++ b/aeraui/platform/aera_backend.cpp
+@@ -58,6 +58,7 @@
+ #include <android-base/properties.h>
+ 
+ #include "data.hpp"
++#include "minuitwrp/minui.h"
+ #include "aera_flash_log.hpp"
+ #include "aera_secrets/aera_secrets.hpp"
+ #include "aeraui/features/root/root_manager.hpp"
+@@ -2817,7 +2818,7 @@ const char *HapticVariable(Haptic haptic) {
+ }
+ 
+ bool RecoveryHapticsAvailable() {
+-  return DataManager::GetIntValue("tw_disable_haptics") == 0;
++  return DataManager::GetIntValue("tw_disable_haptics") == 0 && haptics_available() != 0;
+ }
+ 
+ int RecoveryHapticDuration(Haptic haptic) {
+diff --git a/minuitwrp/events.cpp b/minuitwrp/events.cpp
+index bfb4680..92909dc 100644
+--- a/minuitwrp/events.cpp
++++ b/minuitwrp/events.cpp
+@@ -27,6 +27,8 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <fstream>
++#include <mutex>
++#include <thread>
+ #ifdef USE_INPUT_FF_HAPTICS
+ #include <chrono>
+ #include <condition_variable>
+@@ -70,6 +72,9 @@ static std::atomic_int vib_on_count = 0;
+ 
+ #define LEDS_HAPTICS_DURATION_FILE	"/sys/class/leds/vibrator/duration"
+ #define LEDS_HAPTICS_ACTIVATE_FILE	"/sys/class/leds/vibrator/activate"
++#define LEDS_HAPTICS_SINGLE_DURATION_FILE	"/sys/class/leds/vibrator_single/duration"
++#define LEDS_HAPTICS_SINGLE_ACTIVATE_FILE	"/sys/class/leds/vibrator_single/activate"
++#define LEDS_HAPTICS_BRIGHTNESS_FILE	"/sys/class/leds/vibrator/brightness"
+ 
+ #ifndef SYN_REPORT
+ #define SYN_REPORT          0x00
+@@ -182,6 +187,10 @@ class InputForceFeedbackHaptics {
+         return *instance;
+     }
+ 
++    bool Available() {
++        return OpenDevice();
++    }
++
+     void Pulse(int duration_ms) {
+         {
+             std::lock_guard<std::mutex> lock(mutex_);
+@@ -359,6 +368,43 @@ class InputForceFeedbackHaptics {
+ }  // namespace
+ #endif
+ 
++static bool vibrate_sysfs(int timeout_ms, const char* tout) {
++    if (access(LEDS_HAPTICS_SINGLE_ACTIVATE_FILE, W_OK) == 0) {
++        write_to_file(LEDS_HAPTICS_SINGLE_DURATION_FILE, tout);
++        write_to_file(LEDS_HAPTICS_SINGLE_ACTIVATE_FILE, "1");
++        return true;
++    }
++    if (access(LEDS_HAPTICS_ACTIVATE_FILE, W_OK) == 0) {
++        write_to_file(LEDS_HAPTICS_DURATION_FILE, tout);
++        write_to_file(LEDS_HAPTICS_ACTIVATE_FILE, "1");
++        return true;
++    }
++    if (access(VIBRATOR_TIMEOUT_FILE, W_OK) == 0) {
++        write_to_file(VIBRATOR_TIMEOUT_FILE, tout);
++        return true;
++    }
++    if (access(LEDS_HAPTICS_BRIGHTNESS_FILE, W_OK) == 0) {
++        /* MTK regulator-vibrator exposes only brightness. Pulse it off the UI
++           thread; a newer request owns the final off transition. */
++        static std::mutex brightness_mutex;
++        static unsigned brightness_sequence = 0;
++        std::thread([timeout_ms] {
++            unsigned sequence;
++            {
++                std::lock_guard<std::mutex> lock(brightness_mutex);
++                sequence = ++brightness_sequence;
++            }
++            write_to_file(LEDS_HAPTICS_BRIGHTNESS_FILE, "255");
++            usleep(timeout_ms * 1000);
++            std::lock_guard<std::mutex> lock(brightness_mutex);
++            if (sequence == brightness_sequence)
++                write_to_file(LEDS_HAPTICS_BRIGHTNESS_FILE, "0");
++        }).detach();
++        return true;
++    }
++    return false;
++}
++
+ int vibrate(int timeout_ms)
+ {
+     if (timeout_ms > 10000) timeout_ms = 1000;
+@@ -366,6 +412,8 @@ int vibrate(int timeout_ms)
+     char tout[6];
+     sprintf(tout, "%i", timeout_ms);
+ 
++    if (vibrate_sysfs(timeout_ms, tout)) return 0;
++
+ #ifdef USE_INPUT_FF_HAPTICS
+     InputForceFeedbackHaptics::Instance().Pulse(timeout_ms);
+ #elif defined(USE_QTI_HAPTICS)
+@@ -414,6 +462,28 @@ int vibrate(int timeout_ms)
+ #endif
+ #endif
+ 
++int haptics_available()
++{
++#if defined(TW_NO_HAPTICS)
++    return 0;
++#elif defined(TW_HAPTICS_TSPDRV)
++    return 1;
++#else
++    if (access(LEDS_HAPTICS_SINGLE_ACTIVATE_FILE, W_OK) == 0 ||
++        access(LEDS_HAPTICS_ACTIVATE_FILE, W_OK) == 0 ||
++        access(VIBRATOR_TIMEOUT_FILE, W_OK) == 0 ||
++        access(LEDS_HAPTICS_BRIGHTNESS_FILE, W_OK) == 0)
++        return 1;
++#ifdef USE_INPUT_FF_HAPTICS
++    return InputForceFeedbackHaptics::Instance().Available() ? 1 : 0;
++#elif defined(USE_QTI_HAPTICS) || defined(USE_QTI_AIDL_HAPTICS) || defined(USE_SAMSUNG_HAPTICS)
++    return 1;
++#else
++    return 0;
++#endif
++#endif
++}
++
+ /* Returns empty tokens */
+ static char *vk_strtok_r(char *str, const char *delim, char **save_str)
+ {
+diff --git a/minuitwrp/include/minuitwrp/minui.h b/minuitwrp/include/minuitwrp/minui.h
+index 269f2bd..39c87b0 100644
+--- a/minuitwrp/include/minuitwrp/minui.h
++++ b/minuitwrp/include/minuitwrp/minui.h
+@@ -147,5 +147,6 @@ void res_free_surface(gr_surface surface);
+ int res_scale_surface(gr_surface source, gr_surface* destination, float scale_w, float scale_h);
+ 
+ int vibrate(int timeout_ms);
++int haptics_available();
+ 
+ #endif

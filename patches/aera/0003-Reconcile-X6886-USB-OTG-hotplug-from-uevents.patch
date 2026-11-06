@@ -1,0 +1,499 @@
+From: Arena Agent <agent@arena.ai>
+Date: Thu, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 3/4] AERA: reconcile X6886 USB OTG hotplug from uevents
+
+The mt6789 common fstab describes OTG as /usbotg with a sysfs wildcard
+and voldmanaged subpartitions. AERA only drained disk uevents, never
+serviced the socket from the native UI loop, looked up usb_otg without a
+leading slash in the battery thread, and kept absent removable volumes
+in storage/wipe lists.
+
+Port the TWRP hotplug contract to AERA without its operation executor:
+service uevents non-blockingly from the UI thread only when no backend
+job/decrypt/NAS/plugin operation is active, handle disk and partition
+events, resync from /sys/block after overflow/coldboot with bounded
+250 ms retries, remove stale children, give wildcard children unique
+mount points and OTG labels, avoid mounting during discovery, and filter
+removable storage/wipe entries by presence.
+
+diff --git a/aeraui/core/engine.cpp b/aeraui/core/engine.cpp
+index e478f27..a4bf016 100644
+--- a/aeraui/core/engine.cpp
++++ b/aeraui/core/engine.cpp
+@@ -705,6 +705,10 @@ public:
+     }
+     if (backend_ready_ && !fastboot_mode_ && CanReboot())
+       RecoveryPollDeveloperSettings();
++    if (backend_ready_ && !decryption_active_ && !decrypt_running_ &&
++        !fastboot_mode_ && !operation_running_ && !nas_running_ &&
++        !plugin_running_ && CanReboot())
++      RecoveryPollHotplug();
+     PollUsbAttachment();
+     PollRecentsHold();
+     if (suspended_) return 250;
+diff --git a/aeraui/include/aeraui/backend.hpp b/aeraui/include/aeraui/backend.hpp
+index 9616e10..4ad88b4 100644
+--- a/aeraui/include/aeraui/backend.hpp
++++ b/aeraui/include/aeraui/backend.hpp
+@@ -66,6 +66,7 @@ bool RecoverySetDeveloperSetting(const std::string &id, const std::string &value
+                                  bool remember, std::string *error);
+ bool RecoveryResetDeveloperSettings(std::string *error);
+ void RecoveryPollDeveloperSettings();
++void RecoveryPollHotplug();
+ void RecoverySkipDeveloperSettings();
+ bool RecoveryExportDeveloperSettings(std::string *path, std::string *error);
+ adb_rescue::Status RecoveryAndroidAdbRescueStatus();
+diff --git a/aeraui/platform/aera_backend.cpp b/aeraui/platform/aera_backend.cpp
+index 91888fc..e73a5c3 100644
+--- a/aeraui/platform/aera_backend.cpp
++++ b/aeraui/platform/aera_backend.cpp
+@@ -2801,6 +2801,10 @@ void RecoveryPollDeveloperSettings() {
+   }
+   gDeveloperSettings.Poll();
+ }
++void RecoveryPollHotplug() {
++  PartitionManager.Service_Uevents();
++}
++
+ int RecoveryDefaultHapticDuration(Haptic haptic) {
+   return DefaultHapticDuration(haptic);
+ }
+diff --git a/partition.cpp b/partition.cpp
+index 332ead0..a521508 100644
+--- a/partition.cpp
++++ b/partition.cpp
+@@ -3438,14 +3438,27 @@ bool TWPartition::Find_Wildcard_Block_Devices(const string& Device) {
+ 
+ 		string item = Path + "/";
+ 		item.append(de->d_name);
+-		if (PartitionManager.Find_Partition_By_Block_Device(item))
++		if (PartitionManager.Find_Partition_By_Block_Device(item)) {
++			++mount_point_index;
+ 			continue;
++		}
++		string child_mount;
++		do {
++			child_mount = Mount_Point + "-" + to_string(++mount_point_index);
++		} while (PartitionManager.Find_Partition_By_Path(child_mount));
+ 		TWPartition *part = new TWPartition;
+ 		char buffer[MAX_FSTAB_LINE_LENGTH];
+-		sprintf(buffer, "%s %s-%i auto defaults defaults", item.c_str(), Mount_Point.c_str(), ++mount_point_index);
+-		part->Process_Fstab_Line(buffer, false, NULL);
+-		char display[MAX_FSTAB_LINE_LENGTH];
+-		sprintf(display, "%s %i", Storage_Name.c_str(), mount_point_index);
++		sprintf(buffer, "%s %s auto defaults defaults", item.c_str(), child_mount.c_str());
++		if (!part->Process_Fstab_Line(buffer, false, NULL)) {
++			delete part;
++			continue;
++		}
++		// Discovery must not mount/probe a slow or damaged filesystem on the UI
++		// thread; the user mount path updates sizes when the volume is selected.
++		string display = Storage_Name;
++		if (display.empty() || display == "usbotg" || display == "usb_otg")
++			display = "OTG";
++		display += " " + to_string(mount_point_index);
+ 		part->Storage_Name = display;
+ 		part->Display_Name = display;
+ 		part->Primary_Block_Device = item;
+@@ -3458,7 +3471,7 @@ bool TWPartition::Find_Wildcard_Block_Devices(const string& Device) {
+ 		part->Can_Be_Wiped = Can_Be_Wiped;
+ 		part->Wipe_Available_in_GUI = Wipe_Available_in_GUI;
+ 		part->Find_Actual_Block_Device();
+-		part->Update_Size(false);
++		part->Find_Partition_Size();
+ 		Has_SubPartition = true;
+ 		PartitionManager.Output_Partition(part);
+ 		PartitionManager.Add_Partition(part);
+diff --git a/partitionmanager.cpp b/partitionmanager.cpp
+index d04b64a..18fb0f7 100755
+--- a/partitionmanager.cpp
++++ b/partitionmanager.cpp
+@@ -3357,7 +3357,8 @@ void TWPartitionManager::Get_Partition_List(string ListType,
+     {
+       for (iter = Partitions.begin(); iter != Partitions.end(); iter++)
+ 	{
+-	  if ((*iter)->Wipe_Available_in_GUI && !(*iter)->Is_SubPartition)
++	  if ((*iter)->Wipe_Available_in_GUI && !(*iter)->Is_SubPartition &&
++	      (!(*iter)->Removable || (*iter)->Is_Present))
+ 	    {
+ 	      struct PartitionList part;
+ 	      part.Display_Name = (*iter)->Display_Name;
+@@ -3374,7 +3375,7 @@ void TWPartitionManager::Get_Partition_List(string ListType,
+       string Current_Storage = DataManager::GetCurrentStoragePath();
+       for (iter = Partitions.begin(); iter != Partitions.end(); iter++)
+ 	{
+-	  if ((*iter)->Is_Storage)
++	  if ((*iter)->Is_Storage && (!(*iter)->Removable || (*iter)->Is_Present))
+ 	    {
+ 	      struct PartitionList part;
+ 	      sprintf(free_space, "%llu", (*iter)->Free / 1024 / 1024);
+@@ -4933,42 +4934,63 @@ void TWPartitionManager::Remove_Uevent_Devices(const string& Mount_Point) {
+ }
+ 
+ void TWPartitionManager::Handle_Uevent(const Uevent_Block_Data& uevent_data) {
+-	std::vector<TWPartition*>::iterator iter;
+-
+-	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
+-		if (!(*iter)->Sysfs_Entry.empty()) {
+-			string device;
+-			size_t wildcard = (*iter)->Sysfs_Entry.find("*");
+-			if (wildcard != string::npos) {
+-				device = (*iter)->Sysfs_Entry.substr(0, wildcard);
+-			} else {
+-				device = (*iter)->Sysfs_Entry;
+-			}
+-			if (device == uevent_data.sysfs_path.substr(0, device.size())) {
+-				// Found a match
+-				if (uevent_data.action == "add") {
+-					(*iter)->Primary_Block_Device = "/dev/block/" + uevent_data.block_device;
+-					(*iter)->Alternate_Block_Device = (*iter)->Primary_Block_Device;
+-					(*iter)->Is_Present = true;
+-					LOGINFO("Found a match '%s' '%s'\n", uevent_data.block_device.c_str(), device.c_str());
+-					if (!Decrypt_Adopted()) {
+-						LOGINFO("No adopted storage so finding actual block device\n");
+-						(*iter)->Find_Actual_Block_Device();
++	for (TWPartition* parent : Partitions) {
++		if (parent->Sysfs_Entry.empty()) continue;
++		const size_t wildcard = parent->Sysfs_Entry.find('*');
++		const string device = wildcard == string::npos
++			? parent->Sysfs_Entry : parent->Sysfs_Entry.substr(0, wildcard);
++		if (uevent_data.sysfs_path.compare(0, device.size(), device) != 0) continue;
++
++		if (uevent_data.type == "partition") {
++			// The disk add can arrive before its partitions. Rescan from the
++			// parent wildcard, not from the new partition (sda1* would miss sda2).
++			if (uevent_data.action == "add" || uevent_data.action == "change") {
++				parent->Find_Actual_Block_Device();
++			} else if (uevent_data.action == "remove") {
++				const string block = "/dev/block/" + uevent_data.block_device;
++				for (auto it = Partitions.begin(); it != Partitions.end(); ++it) {
++					TWPartition* child = *it;
++					if (!child->Is_SubPartition || child->SubPartition_Of != parent->Mount_Point ||
++						child->Primary_Block_Device != block) continue;
++					child->UnMount(false);
++					rmdir(child->Mount_Point.c_str());
++					Partitions.erase(it);
++					delete child;
++					parent->Has_SubPartition = false;
++					for (const TWPartition* item : Partitions) {
++						if (item->Is_SubPartition && item->SubPartition_Of == parent->Mount_Point) {
++							parent->Has_SubPartition = true;
++							break;
++						}
+ 					}
+-					return;
+-				} else if (uevent_data.action == "remove") {
+-					(*iter)->Is_Present = false;
+-					(*iter)->Primary_Block_Device = "";
+-					(*iter)->Actual_Block_Device = "";
+-					Remove_Uevent_Devices((*iter)->Mount_Point);
+-					return;
++					break;
+ 				}
+ 			}
++			return;
++		}
++
++		if (uevent_data.action == "add" || uevent_data.action == "change") {
++			parent->Primary_Block_Device = "/dev/block/" + uevent_data.block_device;
++			parent->Alternate_Block_Device = parent->Primary_Block_Device;
++			parent->Is_Present = true;
++			LOGINFO("Found a match '%s' '%s'\n", uevent_data.block_device.c_str(), device.c_str());
++			if (!Decrypt_Adopted()) parent->Find_Actual_Block_Device();
++			return;
++		}
++		if (uevent_data.action == "remove") {
++			parent->Is_Present = false;
++			parent->Primary_Block_Device.clear();
++			parent->Alternate_Block_Device.clear();
++			parent->Actual_Block_Device.clear();
++			Remove_Uevent_Devices(parent->Mount_Point);
++			parent->Has_SubPartition = false;
++			return;
+ 		}
+ 	}
+ 
+-	if (!PartitionManager.Get_Super_Status())
+-		LOGINFO("Found no matching fstab entry for uevent device '%s' - %s\n", uevent_data.sysfs_path.c_str(), uevent_data.action.c_str());
++	// Unrelated block events must not query BootControl merely to suppress a log.
++	LOGINFO("Found no matching fstab entry for uevent device '%s' - %s\n",
++		uevent_data.sysfs_path.c_str(), uevent_data.action.c_str());
+ }
+ 
+ void TWPartitionManager::setup_uevent() {
+@@ -4998,6 +5020,9 @@ void TWPartitionManager::setup_uevent() {
+ 	}
+ 	set_select_fd();
+ 	Coldboot();
++	// Reconcile once after coldboot even if the kernel coalesced/lost an add.
++	uevent_pending_resyncs_ = 1;
++	uevent_next_retry_ = std::chrono::steady_clock::now();
+ }
+ 
+ Uevent_Block_Data TWPartitionManager::get_event_block_values(char *buf, int len) {
+@@ -5035,23 +5060,132 @@ Uevent_Block_Data TWPartitionManager::get_event_block_values(char *buf, int len)
+ 	return ret;
+ }
+ 
+-void TWPartitionManager::read_uevent() {
+-	char buf[1024];
++void TWPartitionManager::ResyncUeventDevices() {
++	// Discover disks from sysfs, including a new disk name whose add was lost.
++	// Only fstab parents explicitly managed by uevent participate.
++	std::vector<std::pair<string, string>> disks;
++	DIR* d = opendir("/sys/block");
++	if (d == nullptr) return; // An unreadable sysfs view is not evidence of removal.
++	while (dirent* de = readdir(d)) {
++		if (de->d_name[0] == '.') continue;
++		const string sys_path = string("/sys/block/") + de->d_name;
++		char resolved[PATH_MAX];
++		if (realpath(sys_path.c_str(), resolved) == nullptr) continue;
++		string path = resolved;
++		if (path.compare(0, 5, "/sys/") == 0) path.erase(0, 4);
++		disks.emplace_back(path, string("/dev/block/") + de->d_name);
++	}
++	closedir(d);
+ 
+-	int len = recv(uevent_pfd.fd, buf, sizeof(buf), MSG_DONTWAIT);
+-	if (len == -1) {
+-      		// remove this message (already noted as TWRP issue #1294)
+-		// LOGINFO("recv error on uevent\n");
+-		return;
++	std::vector<TWPartition*> parents;
++	for (TWPartition* part : Partitions) {
++		if (part->Removable && !part->Is_SubPartition && !part->Sysfs_Entry.empty())
++			parents.push_back(part);
++	}
++	for (TWPartition* parent : parents) {
++		const size_t wildcard = parent->Sysfs_Entry.find('*');
++		const string prefix = wildcard == string::npos
++			? parent->Sysfs_Entry : parent->Sysfs_Entry.substr(0, wildcard);
++		std::vector<string> matches;
++		for (const auto& disk : disks) {
++			if (disk.first.compare(0, prefix.size(), prefix) == 0)
++				matches.push_back(disk.second);
++		}
++		bool current_present = false;
++		for (const string& block : matches) {
++			if (block == parent->Primary_Block_Device) { current_present = true; break; }
++		}
++		// Remove old children before discovery, even if a stale /dev node remains.
++		for (auto it = Partitions.begin(); it != Partitions.end();) {
++			TWPartition* child = *it;
++			if (child->Is_SubPartition && child->SubPartition_Of == parent->Mount_Point &&
++				(!current_present || !TWFunc::Path_Exists(child->Primary_Block_Device))) {
++				child->UnMount(false);
++				rmdir(child->Mount_Point.c_str());
++				it = Partitions.erase(it);
++				delete child;
++			} else {
++				++it;
++			}
++		}
++		parent->Has_SubPartition = false;
++		for (const TWPartition* child : Partitions) {
++			if (child->Is_SubPartition && child->SubPartition_Of == parent->Mount_Point) {
++				parent->Has_SubPartition = true;
++				break;
++			}
++		}
++		if (!current_present) {
++			parent->UnMount(false);
++			parent->Primary_Block_Device.clear();
++			parent->Alternate_Block_Device.clear();
++			parent->Actual_Block_Device.clear();
++			parent->Is_Present = false;
++		}
++		// Preserve Handle_Uevent's sysfs matching and wildcard discovery semantics.
++		for (const string& block : matches) {
++			parent->Primary_Block_Device = block;
++			parent->Alternate_Block_Device = block;
++			parent->Find_Actual_Block_Device();
++		}
++	}
++}
++
++void TWPartitionManager::read_uevent(bool force_resync) {
++	uevent_overrun_ |= force_resync;
++	bool drained = false;
++	for (int count = 0; count < 64; ++count) {
++		char buf[4096];
++		const int len = recv(uevent_pfd.fd, buf, sizeof(buf), MSG_DONTWAIT | MSG_TRUNC);
++		if (len < 0) {
++			if (errno == ENOBUFS) {
++				uevent_overrun_ = true;
++				continue;
++			}
++			drained = errno == EAGAIN || errno == EWOULDBLOCK;
++			if (!drained && errno != EINTR)
++				LOGINFO("recv error on uevent: %s\n", strerror(errno));
++			break;
++		}
++		if (len == 0) { drained = true; break; }
++		if (len >= static_cast<int>(sizeof(buf))) {
++			uevent_overrun_ = true;
++			continue;
++		}
++		const Uevent_Block_Data data = get_event_block_values(buf, len);
++		if (data.subsystem == "block" && (data.type == "disk" || data.type == "partition"))
++			Handle_Uevent(data);
++	}
++	// Coalesce overflow within a burst, but sustained input cannot postpone a
++	// correction forever: at most four bounded batches precede a resync.
++	if (uevent_overrun_ && (drained || ++uevent_dirty_batches_ >= 4)) {
++		uevent_overrun_ = false;
++		uevent_dirty_batches_ = 0;
++		ResyncUeventDevices();
++		uevent_pending_resyncs_ = 8;
++		uevent_next_retry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
++	}
++}
++
++void TWPartitionManager::Service_Uevents() {
++	if (uevent_pfd.fd < 0) return;
++	bool force_resync = false;
++	struct pollfd pfd = uevent_pfd;
++	pfd.revents = 0;
++	const int ready = poll(&pfd, 1, 0);
++	if (ready < 0) {
++		if (errno != EINTR) force_resync = true;
++	} else if (ready > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
++		force_resync = true;
+ 	}
+-	/*int i = 0; // Print all uevent output for test /debug
+-	while (i<len) {
+-		printf("%s\n", buf+i);
+-		i += strlen(buf+i)+1;
+-	}*/
+-	Uevent_Block_Data uevent_data = get_event_block_values(buf, len);
+-	if (uevent_data.subsystem == "block" && uevent_data.type == "disk") {
+-		PartitionManager.Handle_Uevent(uevent_data);
++	read_uevent(force_resync);
++
++	const auto now = std::chrono::steady_clock::now();
++	if (uevent_pending_resyncs_ != 0 && now >= uevent_next_retry_) {
++		--uevent_pending_resyncs_;
++		ResyncUeventDevices();
++		if (uevent_pending_resyncs_ != 0)
++			uevent_next_retry_ = now + std::chrono::milliseconds(250);
+ 	}
+ }
+ 
+@@ -5059,6 +5193,9 @@ void TWPartitionManager::close_uevent() {
+ 	if (uevent_pfd.fd > 0)
+ 		close(uevent_pfd.fd);
+ 	uevent_pfd.fd = -1;
++	uevent_overrun_ = false;
++	uevent_dirty_batches_ = 0;
++	uevent_pending_resyncs_ = 0;
+ }
+ 
+ void TWPartitionManager::Add_Partition(TWPartition* Part) {
+@@ -6220,43 +6357,6 @@ bool TWPartitionManager::Check_Pending_Merges() {
+ 	return true;
+ }
+ 
+-void TWPartitionManager::Check_UsbOtg_Status() {
+-	static bool mtp_was_enabled;
+-	static bool usbotg_mounted = false;
+-	static string usbotg_prim = "";
+-	static string usbotg_alt = "";
+-	static TWPartition* usbotg = Find_Partition_By_Path("usb_otg");
+-
+-	if (usbotg && !usbotg->Primary_Block_Device.empty()) {
+-		usbotg_prim = usbotg->Primary_Block_Device;
+-		usbotg_alt = usbotg->Alternate_Block_Device;
+-	} else return;
+-
+-	if (TWFunc::Path_Exists(usbotg_prim) || (!usbotg_alt.empty() && TWFunc::Path_Exists(usbotg_alt))) {
+-		// Auto-mount only once when usb_otg was connected
+-		if (!usbotg_mounted) goto mount;
+-	} else if (usbotg_mounted) {
+-		// Is seems usb_otg was disconnected, so unmount it
+-		goto unmount;
+-	}
+-	return;
+-
+-mount:
+-	mtp_was_enabled = TWFunc::Toggle_MTP(false);
+-	usbotg->Mount(true);
+-	usbotg_mounted = true;
+-	return;
+-
+-unmount:
+-	usbotg->UnMount(false);
+-	usbotg->Is_Present = false;
+-	usbotg->Size = 0;
+-	usbotg->Used = 0;
+-	usbotg->Free = 0;
+-	usbotg_mounted = false;
+-	TWFunc::Toggle_MTP(mtp_was_enabled);
+-}
+-
+ std::pair<string, string> TWPartitionManager::Get_Partition_Checksums(TWPartition* twrpPart) {
+ 	std::pair<string, string> res;
+ 	string command = "/system/bin/sha256sum -b " + twrpPart->Primary_Block_Device;
+diff --git a/partitions.hpp b/partitions.hpp
+index 1efdb45..7d2e2f4 100644
+--- a/partitions.hpp
++++ b/partitions.hpp
+@@ -23,6 +23,7 @@
+ #define __TWRP_Partition_Manager
+ 
+ #include <map>
++#include <chrono>
+ #include <cstdint>
+ #include <functional>
+ #include <vector>
+@@ -458,7 +459,7 @@ public:
+ 	void Handle_Uevent(const Uevent_Block_Data& uevent_data);                 // Handle uevent data
+ 	void setup_uevent();                                                      // Opens the uevent netlink socket
+ 	Uevent_Block_Data get_event_block_values(char *buf, int len);             // Scans the buffer from uevent data and loads the appropriate data into a Uevent_Block_Data struct for processing
+-	void read_uevent();                                                       // Reads uevent data into a buffer
++	void read_uevent(bool force_resync = false);                              // Drains a bounded uevent batch
+ 	void close_uevent();                                                      // Closes the uevent netlink socket
+ 	void Add_Partition(TWPartition* Part);                                    // Adds a new partition to the Partitions vector
+ 	bool Storage_Is_Encrypted(void);				  	  // Returns whether the device is encrypted
+@@ -482,7 +483,7 @@ public:
+ 	bool Is_Image_Flash_Batch() const { return image_flash_batch_; }
+ 	bool Check_Pending_Merges();                                              // Check and run pending merges on data for VAB devices
+ 	bool Disable_AVB2(bool Display_Info);                                     // Disable AVB2.0 in vbmeta/vbmeta_system
+-	void Check_UsbOtg_Status();						  // Checks if usb_otg is connected
++	void Service_Uevents();                                                 // Non-blocking UI-thread hotplug reconciliation
+ 	std::pair<string, string> Get_Partition_Checksums(TWPartition* twrpPart); // Generates and returns the SHA-256 checksum for the specified partition
+ 	bool Mount_Super_Toggle(const string& arg, bool user_toggle = false);	  // Changes Mount_Read_Only flag for all dynamic partitions
+ 
+@@ -500,6 +501,7 @@ private:
+ 	void Post_Decrypt(const string& Block_Device);                            // Completes various post-decrypt tasks
+ 	void Coldboot_Scan(std::vector<string> *sysfs_entries, const string& Path, int depth); // Scans subfolders to find matches to the paths stored in sysfs_entries so we can trigger the uevent system to "re-add" devices
+ 	void Coldboot();                                                          // Starts the scan of the /sys/block folder
++	void ResyncUeventDevices();                                               // Reconciles removable parents/children from sysfs
+ 	bool Prepare_Empty_Folder(const std::string& Folder);                     // Creates an empty folder at Folder. If the folder already exists, the folder is deleted, then created
+ 	pid_t mtppid;
+ 	bool mtp_was_enabled;
+@@ -523,6 +525,10 @@ private:
+ 	string Active_Slot_Display;                                               // Current Active Slot (A or B) for display purposes
+ 	std::vector<users_struct> Users_List;                                     // List of FBE users
+ 	std::vector<std::string> Super_Partition_List;                            // Display value for super partitions
++	bool uevent_overrun_ = false;
++	unsigned uevent_dirty_batches_ = 0;
++	unsigned uevent_pending_resyncs_ = 0;
++	std::chrono::steady_clock::time_point uevent_next_retry_{};
+ };
+ 
+ extern TWPartitionManager PartitionManager;
+diff --git a/twrp.cpp b/twrp.cpp
+index 0bc2293..6a82d79 100644
+--- a/twrp.cpp
++++ b/twrp.cpp
+@@ -738,8 +738,8 @@ int main(int argc, char **argv) {
+ 			DataManager::SetValue("tw_battery", value);
+ 			DataManager::SetValue("charging_now", (charging == '+') ? "1" : "0");
+ 
+-			// Check usb_otg status
+-			PartitionManager.Check_UsbOtg_Status();
++			// USB OTG is reconciled by the UI-thread uevent service
++			// (RecoveryPollHotplug -> PartitionManager.Service_Uevents).
+ 
+ 			// Sleep for a specified interval (e.g., 1 second) before checking again
+ 			std::this_thread::sleep_for(std::chrono::seconds(1));

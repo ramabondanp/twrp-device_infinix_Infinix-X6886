@@ -1,0 +1,103 @@
+From: Arena Agent <agent@arena.ai>
+Date: Thu, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 2/4] AERA: signal storage readiness before TEE consumers
+
+The mt6789 common init files start Trustonic/mobicore only after
+twrp.storage.ready=1. AERA never emitted that property, and its fstab
+setup ran Partition_Post_Processing()/Decrypt_Data() before the final
+mount cleanup.
+
+Match the TWRP startup contract: unlock blocks, finish apex/vendor mount
+cleanup, explicitly unmount /data and main partitions, publish
+twrp.storage.ready, then post-process partitions and recover keys. Cold
+fastbootd skips fstab setup, so publish the same property after logical
+partitions are released.
+
+diff --git a/partitionmanager.cpp b/partitionmanager.cpp
+index d04b64a..970dd07 100755
+--- a/partitionmanager.cpp
++++ b/partitionmanager.cpp
+@@ -777,25 +777,6 @@ void TWPartitionManager::Setup_Fstab_Partitions(bool Display_Error) {
+ 		std::vector<TWPartition*>::iterator iter;
+ 		unsigned int storageid = 1 << 16;	// upper 16 bits are for physical storage device, we pretend to have only one
+ 
+-		for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
+-			(*iter)->Partition_Post_Processing(Display_Error);
+-
+-			if ((*iter)->Is_Storage) {
+-				++storageid;
+-				(*iter)->MTP_Storage_ID = storageid;
+-			}
+-
+-			if (!settings_partition && (*iter)->Is_Settings_Storage && (*iter)->Is_Present)
+-				settings_partition = (*iter);
+-			else
+-				(*iter)->Is_Settings_Storage = false;
+-
+-			if (!andsec_partition && (*iter)->Has_Android_Secure && (*iter)->Is_Present)
+-				andsec_partition = (*iter);
+-			else
+-				(*iter)->Has_Android_Secure = false;
+-		}
+-
+ 		Unlock_Block_Partitions();
+ 
+ 		//Setup Apex before decryption
+@@ -828,6 +809,39 @@ void TWPartitionManager::Setup_Fstab_Partitions(bool Display_Error) {
+ 			sys->UnMount(Display_Error);
+ 	#endif
+ 
++		// Finish startup mount cleanup before starting HALs and recovering keys.
++		// X6886's Trustonic init services gate on twrp.storage.ready; setting it
++		// after Partition_Post_Processing()/Decrypt_Data() is too late for the
++		// metadata key directory and FBE DE unlock.
++		if (Find_Partition_By_Path("/data") && !UnMount_By_Path("/data", false)) {
++			LOGERR("Unable to unmount /data before signaling storage readiness.\n");
++			return;
++		}
++		UnMount_Main_Partitions();
++		if (!android::base::SetProperty("twrp.storage.ready", "1")) {
++			LOGERR("Unable to set twrp.storage.ready; TEE-backed startup may fail.\n");
++			return;
++		}
++
++		for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
++			(*iter)->Partition_Post_Processing(Display_Error);
++
++			if ((*iter)->Is_Storage) {
++				++storageid;
++				(*iter)->MTP_Storage_ID = storageid;
++			}
++
++			if (!settings_partition && (*iter)->Is_Settings_Storage && (*iter)->Is_Present)
++				settings_partition = (*iter);
++			else
++				(*iter)->Is_Settings_Storage = false;
++
++			if (!andsec_partition && (*iter)->Has_Android_Secure && (*iter)->Is_Present)
++				andsec_partition = (*iter);
++			else
++				(*iter)->Has_Android_Secure = false;
++		}
++
+ 		if (!datamedia && !settings_partition && Find_Partition_By_Path("/sdcard") == NULL && Find_Partition_By_Path("/internal_sd") == NULL && Find_Partition_By_Path("/internal_sdcard") == NULL && Find_Partition_By_Path("/emmc") == NULL) {
+ 			// Attempt to automatically identify /data/media emulated storage devices
+ 			TWPartition* Dat = Find_Partition_By_Path("/data");
+diff --git a/twrp.cpp b/twrp.cpp
+index 0bc2293..60eb997 100644
+--- a/twrp.cpp
++++ b/twrp.cpp
+@@ -144,6 +144,13 @@ static void process_fastbootd_mode() {
+ 			return;
+ 		}
+ 
++		// Cold fastbootd skips Setup_Fstab_Partitions(), but device init may still
++		// gate TEE-backed services on the same storage-ready contract.
++		if (!android::base::SetProperty("twrp.storage.ready", "1")) {
++			LOGERR("Unable to set twrp.storage.ready for fastbootd.\n");
++			return;
++		}
++
+ #ifdef AB_OTA_UPDATER
+ 		DataManager::SetValue("tw_active_slot", PartitionManager.Get_Active_Slot_Display());
+ #endif

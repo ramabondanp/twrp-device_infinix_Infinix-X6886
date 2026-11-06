@@ -18,7 +18,7 @@ Unofficial TWRP 16.0 recovery for the Infinix HOT 60 Pro+.
 | Recovery image | `vendor_boot.img` |
 | Development branch | `twrp-16.0-tos16` |
 
-## Working features
+## Working features (TWRP baseline, hardware-confirmed)
 
 - Recovery boot
 - Touchscreen
@@ -38,10 +38,21 @@ used, and steps to reproduce the problem.
 Use **Advanced → Export logs** to save recovery logs. Review them for
 personal information before sharing.
 
+## AERA Recovery (Alpha)
+
+This tree also contains an **unvalidated source-level port** to
+[AERA Recovery](https://github.com/AERA-Recovery) (`aera-16.0`). It preserves the
+X6886 `vendor_boot` layout and adapts haptics, TEE readiness, USB OTG hotplug,
+and repack guards to AERA's native UI/core. See [docs/AERA.md](docs/AERA.md) for
+build instructions and the hardware validation checklist. Do not flash the AERA
+port until it has been built and tested on the device.
+
 ## Development
 
-This tree uses the [TWRP-Test manifest](https://github.com/TWRP-Test/platform_manifest_twrp_aosp)
-(`twrp-16.0` branch), not the official TeamWin minimal manifest.
+The TWRP baseline uses the [TWRP-Test manifest](https://github.com/TWRP-Test/platform_manifest_twrp_aosp)
+(`twrp-16.0` branch), not the official TeamWin minimal manifest. The AERA port
+uses the AERA `aera-16.0` manifest instead; `vendorsetup.sh` detects the synced
+recovery core and applies the matching patch set.
 
 Build instructions and development notes are in [AGENTS.md](AGENTS.md),
 which is written primarily for AI coding agents.

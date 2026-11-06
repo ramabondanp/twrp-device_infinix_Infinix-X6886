@@ -1,7 +1,9 @@
-# AGENTS.md — Infinix X6886 / TWRP 16.0
+# AGENTS.md — Infinix X6886 / TWRP 16.0 and AERA aera-16.0
 
 Durable guidance for the Infinix HOT 60 Pro+ (`Infinix-X6886`, MT6789).
-Read before working on this device or its common tree.
+Read before working on this device or its common tree. The hardware-confirmed
+baseline is TWRP-Test `twrp-16.0`; the AERA `aera-16.0` port is Alpha and has
+not been hardware-validated.
 
 ## Anchor policy
 
@@ -20,9 +22,10 @@ Read before working on this device or its common tree.
 1. **Android 16 firmware with a 6.12 kernel only.** Android 15 and older
    firmware are unsupported. Preserve both normal Android boot and recovery
    boot.
-2. **Keep TWRP/build-system source changes as patches** under the device
-   repositories' `patches/`, applied by `vendorsetup.sh`. Do not leave
-   unrecorded source edits as the implementation of a fix.
+2. **Keep TWRP/AERA/build-system source changes as patches** under the device
+   repositories' `patches/` (AERA ports under `patches/aera/`), applied by
+   `vendorsetup.sh`. Do not leave unrecorded source edits as the implementation
+   of a fix.
 3. **On ServerHive, use workspace-local `tmp/`, never `/tmp`,** for scratch
    work; the host does not allow writes to `/tmp`.
 4. **Commit subjects use a double scope:**
@@ -41,7 +44,9 @@ Read before working on this device or its common tree.
 
 ## Repositories and ownership
 
-Both repositories use `twrp-16.0-tos16`.
+Both device repositories use `twrp-16.0-tos16`. For AERA, the recovery core,
+build/make, and vendor trees come from the AERA `aera-16.0` manifest, while the
+X6886/common device trees still use `twrp-16.0-tos16`.
 Paths below are relative to the Android source-tree root, which contains
 multiple Git repositories rather than one workspace-wide repository.
 
@@ -131,6 +136,53 @@ patch path. Distinguish an already-applied patch from a real conflict.
 Applied patches intentionally make `build/make` and `bootable/recovery`
 dirty. Check their diffs before changing anything; do not commit the
 applied copies upstream or discard unrelated edits.
+
+### AERA Recovery port (Alpha)
+
+`vendorsetup.sh` detects the synced core: `bootable/recovery/aera_config.mk`
+plus `aera_build.mk` means AERA; otherwise it expects the TWRP-Test core. It
+exports the AERA packaging environment and applies `patches/aera/` instead of
+the TWRP haptics/common storage/repack patches. The common zstd ramdisk patch
+still applies to AERA `build/make`. See `docs/AERA.md` for the full checklist.
+
+```bash
+repo init -u https://github.com/AERA-Recovery/android_manifest.git -b aera-16.0
+repo sync -c --no-tags --optimized-fetch
+# place this tree at device/infinix/Infinix-X6886
+source build/envsetup.sh
+lunch twrp_X6886-bp2a-eng
+mka vendorbootimage
+```
+
+| Patch (relative to X6886) | Target |
+|---|---|
+| `patches/aera/0001-minuitwrp-Probe-X6886-sysfs-haptics.patch` | `bootable/recovery` |
+| `patches/aera/0002-Signal-storage-readiness-before-TEE-consumers.patch` | `bootable/recovery` |
+| `patches/aera/0003-Reconcile-X6886-USB-OTG-hotplug-from-uevents.patch` | `bootable/recovery` |
+| `patches/aera/0004-Respect-disabled-recovery-repacking.patch` | `bootable/recovery` |
+| common `patches/0001-Add-zstd-ramdisk-compression.patch` | `build/make` |
+
+AERA architecture constraints:
+
+- `aera.mk` is included only when `bootable/recovery/aera_config.mk` exists;
+  `twrp_X6886.mk` inherits `vendor/twrp/config/common.mk` only for AERA. Do not
+  change the TWRP product inheritance when editing AERA flags.
+- Keep `BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT=true` and do not enable
+  `AERA_VENDOR_BOOT_RECOVERY`; the latter forces experimental legacy vAB
+  installer compensation. Preserve the zstd PLATFORM ramdisk plus empty
+  RECOVERY fragment and the 64 MiB size limit.
+- AERA must emit `twrp.storage.ready=1` before `Partition_Post_Processing()` /
+  `Decrypt_Data()`; common Trustonic init gates on it. Cold fastbootd emits it
+  after logical unmap.
+- AERA lacks TWRP's operation executor/list-snapshot locking. The OTG patch
+  services uevents on the native UI thread only while no backend job, decrypt,
+  NAS, or plugin operation is active, with bounded resync retries. Do not move
+  partition-list mutation into the battery thread or add GUI-thread sleeps.
+- Keep repack/reflash and the recovery ZIP installer disabled
+  (`AERA_NO_REFLASH_CURRENT_RECOVERY=1`, `AERA_INCLUDE_REPACKTOOLS=false`,
+  `AERA_DISABLE_UPDATEZIP=1`). The bundled repacker cannot rewrite this
+  device's PLATFORM-ramdisk layout. AERA's vendor hook may still stage prebuilt
+  `magiskboot` as a boot-image tool; check the final ramdisk/image size.
 
 ## Architecture decisions
 
@@ -283,11 +335,12 @@ boards load recovery with no haptic feedback.
 
 ## Verified baseline and validation
 
-Hardware-confirmed on X6886: recovery boot, touch, vibration, USB OTG
-hotplug (including multi-partition drives), FBE decryption (including
-PIN/password-protected data), battery and charging reporting, ADB and
-ADB sideload, fastbootd, A/B slot switching, and normal Android boot
-with the same image.
+Hardware-confirmed on X6886 for the **TWRP baseline**: recovery boot, touch,
+vibration, USB OTG hotplug (including multi-partition drives), FBE decryption
+(including PIN/password-protected data), battery and charging reporting, ADB
+and ADB sideload, fastbootd, A/B slot switching, and normal Android boot with
+the same image. The **AERA port is not hardware-confirmed**; host-side patch
+and make parsing checks are not device validation.
 
 Before calling a functional change ready:
 

@@ -13,8 +13,8 @@
 #	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #	GNU General Public License for more details.
 #
-# 	This software is released under GPL version 3 or any later version.
-#	See <http://www.gnu.org/licenses/>.
+# 	You should have received a copy of the GNU General Public License
+#	along with OrangeFox.  If not, see <http://www.gnu.org/licenses/>.
 #
 # 	Please maintain this if you use this script or any part of it
 #
@@ -54,6 +54,51 @@ apply_X6886_patch() {
 	fi
 }
 
+detect_X6886_recovery() {
+	local root="$1"
+	if [ ! -d "$root/bootable/recovery" ]; then
+		echo "ERROR: bootable/recovery is missing; sync a TWRP-Test or AERA manifest first." >&2
+		return 1
+	fi
+	if [ -f "$root/bootable/recovery/aera_config.mk" ] && [ -f "$root/bootable/recovery/aera_build.mk" ]; then
+		echo aera
+	elif [ -f "$root/bootable/recovery/twrpminui/events.cpp" ] || [ -f "$root/bootable/recovery/Android.bp" ]; then
+		echo twrp
+	else
+		echo "ERROR: Unsupported bootable/recovery core; expected TWRP-Test twrp-16.0 or AERA aera-16.0." >&2
+		return 1
+	fi
+}
+
+export_X6886_aera_env() {
+	# These shell exports are captured by AERA's printconfig into
+	# /tmp/X6886/fox_env.sh and consumed by vendor/recovery/AERA_A16.sh.
+	# The matching make-side configuration lives in aera.mk.
+	export LC_ALL="C"
+	export AERA_AB_DEVICE=1
+	export AERA_VIRTUAL_AB_DEVICE=1
+	export AERA_VANILLA_BUILD=1
+	export AERA_PRODUCT_PREFIX=AERA
+	export AERA_BUILD_STATUS=Unofficial
+	export AERA_BUILD_TYPE=Alpha
+	export AERA_NO_REFLASH_CURRENT_RECOVERY=1
+	export AERA_INCLUDE_REPACKTOOLS=false
+	export AERA_DISABLE_UPDATEZIP=1
+	export AERA_USE_UPDATED_MAGISKBOOT=0
+	export AERA_USE_TAR_BINARY=1
+	export AERA_USE_SED_BINARY=1
+	export AERA_USE_GREP_BINARY=1
+	export AERA_USE_LZ4_BINARY=1
+	export AERA_USE_ZSTD_BINARY=1
+	export AERA_USE_DATE_BINARY=1
+	export AERA_USE_XZ_UTILS=1
+	export AERA_SETTINGS_ROOT_DIRECTORY=/data/recovery
+	export AERA_MISCELLANEOUS_ROOT_DIRECTORY=/sdcard
+	export TARGET_DEVICE_ALT="Infinix-X6886"
+	export AERA_TARGET_DEVICES="$TARGET_DEVICE_ALT"
+	unset AERA_MAINTAINER_PATCH_VERSION
+}
+
 setup_X6886() {
 	local root
 	root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd) || return 1
@@ -68,16 +113,38 @@ setup_X6886() {
 	# mt6789-common
 	fetch_mt6789_common_repo "$root" || return 1
 
-	# Patches
-	apply_X6886_patch "$root/bootable/recovery" \
-		"$root/device/infinix/Infinix-X6886/patches/0001-Change-haptics-activation-file-path.patch" || return 1
-	apply_X6886_patch "$root/bootable/recovery" \
-		"$root/device/transsion/mt6789-common/patches/0003-Refresh-removable-partitions-after-uevent.patch" || return 1
-	apply_X6886_patch "$root/bootable/recovery" \
-		"$root/device/transsion/mt6789-common/patches/0002-Respect-disabled-repacking.patch" || return 1
-	apply_X6886_patch "$root/build/make" \
-		"$root/device/transsion/mt6789-common/patches/0001-Add-zstd-ramdisk-compression.patch" || return 1
-	echo "OK: All patched"
+	local flavor
+	flavor=$(detect_X6886_recovery "$root") || return 1
+	echo "X6886 recovery core: $flavor"
+
+	local device="$root/device/infinix/Infinix-X6886"
+	local common="$root/device/transsion/mt6789-common"
+	if [ "$flavor" = aera ]; then
+		export_X6886_aera_env
+		# AERA-specific ports of the device haptics and common storage/repack
+		# patches. The TWRP patches do not apply to AERA's minuitwrp/native UI.
+		apply_X6886_patch "$root/bootable/recovery" \
+			"$device/patches/aera/0001-minuitwrp-Probe-X6886-sysfs-haptics.patch" || return 1
+		apply_X6886_patch "$root/bootable/recovery" \
+			"$device/patches/aera/0002-Signal-storage-readiness-before-TEE-consumers.patch" || return 1
+		apply_X6886_patch "$root/bootable/recovery" \
+			"$device/patches/aera/0003-Reconcile-X6886-USB-OTG-hotplug-from-uevents.patch" || return 1
+		apply_X6886_patch "$root/bootable/recovery" \
+			"$device/patches/aera/0004-Respect-disabled-recovery-repacking.patch" || return 1
+		apply_X6886_patch "$root/build/make" \
+			"$common/patches/0001-Add-zstd-ramdisk-compression.patch" || return 1
+	else
+		# TWRP-Test baseline.
+		apply_X6886_patch "$root/bootable/recovery" \
+			"$device/patches/0001-Change-haptics-activation-file-path.patch" || return 1
+		apply_X6886_patch "$root/bootable/recovery" \
+			"$common/patches/0003-Refresh-removable-partitions-after-uevent.patch" || return 1
+		apply_X6886_patch "$root/bootable/recovery" \
+			"$common/patches/0002-Respect-disabled-repacking.patch" || return 1
+		apply_X6886_patch "$root/build/make" \
+			"$common/patches/0001-Add-zstd-ramdisk-compression.patch" || return 1
+	fi
+	echo "OK: All patched ($flavor)"
 }
 
 setup_X6886
