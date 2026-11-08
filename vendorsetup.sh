@@ -72,6 +72,8 @@ setup_X6886() {
 	apply_X6886_patch "$root/bootable/recovery" \
 		"$root/device/infinix/Infinix-X6886/patches/0001-Change-haptics-activation-file-path.patch" || return 1
 	apply_X6886_patch "$root/bootable/recovery" \
+		"$root/device/transsion/mt6789-common/patches/0003-Fallback-to-unfiltered-DRM-plane-selection.patch" || return 1
+	apply_X6886_patch "$root/bootable/recovery" \
 		"$root/device/transsion/mt6789-common/patches/0002-Respect-disabled-repacking.patch" || return 1
 	apply_X6886_patch "$root/build/make" \
 		"$root/device/transsion/mt6789-common/patches/0001-Add-zstd-ramdisk-compression.patch" || return 1

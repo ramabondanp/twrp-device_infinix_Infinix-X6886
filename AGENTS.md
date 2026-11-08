@@ -120,6 +120,7 @@ the script does not switch or update an existing checkout.
 |---|---|---|
 | `patches/0001-Add-zstd-ramdisk-compression.patch` | Common | `build/make` |
 | `patches/0002-Respect-disabled-repacking.patch` | Common | `bootable/recovery` |
+| `patches/0003-Fallback-to-unfiltered-DRM-plane-selection.patch` | Common | `bootable/recovery` |
 | `patches/0001-Change-haptics-activation-file-path.patch` | X6886 | `bootable/recovery` |
 
 A patch error is not automatically harmless. Check forward application
