@@ -120,7 +120,6 @@ the script does not switch or update an existing checkout.
 |---|---|---|
 | `patches/0001-Add-zstd-ramdisk-compression.patch` | Common | `build/make` |
 | `patches/0002-Respect-disabled-repacking.patch` | Common | `bootable/recovery` |
-| `patches/0003-Refresh-removable-partitions-after-uevent.patch` | Common | `bootable/recovery` |
 | `patches/0001-Change-haptics-activation-file-path.patch` | X6886 | `bootable/recovery` |
 
 A patch error is not automatically harmless. Check forward application
@@ -183,17 +182,18 @@ Keep the sysfs path. A static `/dev/block/sd*N` entry is evaluated only when
 the fstab is parsed and is not refreshed when the drive is plugged in later.
 
 TWRP can receive the disk-add event before the partition nodes exist, and a
-partition event that arrives first has no block device to resolve. Keep
-common's `patches/0003-Refresh-removable-partitions-after-uevent.patch`
-applied by `vendorsetup.sh`; it reconciles removable sysfs parents after each
-uevent burst and creates or removes the child partitions.
+partition event that arrives first has no block device to resolve. Upstream
+`twrp-16.0` reconciles removable sysfs parents after each uevent burst and
+retries pending nodes on the storage worker (commit
+`9734c17207678342e97779a3bde6cf75f6fa83ff`, "recovery: Retry hotplug
+discovery until block nodes are ready"). No local patch is applied.
 
 The entire burst can also finish before `ueventd` creates `/dev/block` nodes.
-Keep the bounded delayed retries on the background storage worker: after
-block add/change or socket-loss events, it retries discovery on the existing
-snapshot ticks and publishes the reconciled lists. A single immediate scan
-can miss the node and wait for an unrelated battery event. Do not replace
-the retries with GUI-thread sleeps or continuous idle sysfs polling.
+Keep the pending-node retries on the background storage worker: it retries
+discovery on the existing snapshot ticks and publishes the reconciled lists.
+A single immediate scan can miss the node and wait for an unrelated battery
+event. Do not replace the retries with GUI-thread sleeps or continuous idle
+sysfs polling.
 
 Measure hotplug latency without `strace`/`ptrace` attached; tracing can alter
 event timing and mask the device-node race.
